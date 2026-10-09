@@ -1,0 +1,221 @@
+name: Safe Deployment Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - fix/pipeline
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  NODE_VERSION: '20'
+  IMAGE_TAG: ${{ github.sha }}
+  RELEASE_SHA: ${{ github.sha }}
+  RUN_STARTED_AT: ${{ github.run_started_at }}
+
+jobs:
+  source:
+    name: Source
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.metadata.outputs.sha }}
+      timestamp: ${{ steps.metadata.outputs.timestamp }}
+    steps:
+      - name: Checkout exact ref
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate checkout and record metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$(git rev-parse --verify HEAD)"
+          test "$(git status --porcelain)" = ""
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "Validated commit $(git rev-parse HEAD) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: source
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Create release artifact
+        run: tar --exclude=node_modules --exclude=.git -czf /tmp/release-${{ github.sha }}.tgz . && cp /tmp/release-${{ github.sha }}.tgz release-${{ github.sha }}.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: release-${{ github.sha }}.tgz
+          if-no-files-found: error
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+      - name: Extract release artifact
+        run: tar -xzf release-${{ github.sha }}.tgz
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Unit and integration tests with coverage gate
+        run: npm test -- --runInBand --coverage --coverageThreshold='{"global":{"lines":80,"statements":80,"functions":80,"branches":80}}'
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+      - name: Extract release artifact
+        run: tar -xzf release-${{ github.sha }}.tgz
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Static analysis
+        run: npx --no-install eslint src/**/*.js
+
+  deploy_staging:
+    name: Deploy-Staging
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+      - name: Extract release artifact
+        run: tar -xzf release-${{ github.sha }}.tgz
+      - name: Deploy immutable release to staging
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          REGISTRY: ${{ secrets.REGISTRY }}
+          IMAGE_TAG: ${{ github.sha }}
+          DEPLOY_ENV: staging
+          SERVICE_NAME: orion-api-staging
+        run: bash scripts/deploy.sh
+
+  deploy_production:
+    name: Deploy-Production
+    runs-on: ubuntu-latest
+    needs: deploy_staging
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+      - name: Extract release artifact
+        run: tar -xzf release-${{ github.sha }}.tgz
+      - name: Deploy immutable release to production
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          REGISTRY: ${{ secrets.REGISTRY }}
+          IMAGE_TAG: ${{ github.sha }}
+          DEPLOY_ENV: production
+          SERVICE_NAME: orion-api
+        run: bash scripts/deploy.sh
+
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    needs: deploy_production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke and health checks
+        env:
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
+        run: |
+          set -euo pipefail
+          test -n "$PRODUCTION_URL"
+          bash scripts/healthcheck.sh "$PRODUCTION_URL"
+          curl --fail --silent --show-error --retry 5 --retry-delay 5 "$PRODUCTION_URL/health"
+
+  rollback:
+    name: Rollback
+    runs-on: ubuntu-latest
+    needs: verify
+    if: always() && needs.verify.result == 'failure'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Roll back failed release
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+          PREVIOUS_IMAGE_TAG: ${{ secrets.PREVIOUS_IMAGE_TAG }}
+        run: |
+          set -euo pipefail
+          test -n "$PREVIOUS_IMAGE_TAG"
+          bash scripts/rollback.sh "$PREVIOUS_IMAGE_TAG"
+      - name: Verify rollback health
+        env:
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
+        run: bash scripts/healthcheck.sh "$PRODUCTION_URL"
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [source, build, test, security, deploy_staging, deploy_production, verify, rollback]
+    steps:
+      - name: Report deployment status
+        run: |
+          echo "Deployment status: ${{ job.status }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Started: ${{ needs.source.outputs.timestamp }}"
+          echo "Source: ${{ needs.source.result }}"
+          echo "Build: ${{ needs.build.result }}"
+          echo "Test: ${{ needs.test.result }}"
+          echo "Security: ${{ needs.security.result }}"
+          echo "Staging: ${{ needs.deploy_staging.result }}"
+          echo "Production: ${{ needs.deploy_production.result }}"
+          echo "Verify: ${{ needs.verify.result }}"
+          echo "Rollback: ${{ needs.rollback.result }}"
+          if [ "${{ needs.verify.result }}" = "failure" ] || [ "${{ needs.build.result }}" = "failure" ] || [ "${{ needs.test.result }}" = "failure" ] || [ "${{ needs.security.result }}" = "failure" ]; then
+            echo "Deployment pipeline failed; inspect the failed gate above."
+            exit 1
+          fi

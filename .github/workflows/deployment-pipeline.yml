@@ -61,7 +61,7 @@ jobs:
       - name: Build
         run: npm run build
       - name: Create release artifact
-        run: tar --exclude=node_modules --exclude=.git --exclude=release-${{ github.sha }}.tgz -czf release-${{ github.sha }}.tgz .
+        run: tar --exclude=node_modules --exclude=.git -czf /tmp/release-${{ github.sha }}.tgz . && cp /tmp/release-${{ github.sha }}.tgz release-${{ github.sha }}.tgz
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ github.sha }}
@@ -204,7 +204,7 @@ jobs:
         run: |
           echo "Deployment status: ${{ job.status }}"
           echo "Commit: ${{ github.sha }}"
-          echo "Started: ${{ github.run_started_at }}"
+          echo "Started: ${{ needs.source.outputs.timestamp }}"
           echo "Source: ${{ needs.source.result }}"
           echo "Build: ${{ needs.build.result }}"
           echo "Test: ${{ needs.test.result }}"
